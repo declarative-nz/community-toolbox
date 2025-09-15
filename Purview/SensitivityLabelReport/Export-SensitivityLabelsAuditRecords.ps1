@@ -86,6 +86,9 @@ Search-UnifiedAuditLog: https://learn.microsoft.com/microsoft-365/compliance/aud
 Get-Label: https://learn.microsoft.com/powershell/module/exchange/get-label
 #>
 
+#Requires -Version 7
+#Requires -Modules ExchangeOnlineManagement
+
 param(
     [Parameter()]
     [object]$StartDate = (Get-Date).AddDays(-180),
@@ -525,7 +528,14 @@ function New-InteractiveHtmlReport {
             'NewPriority','OldPriority','LabelAction','EventCode','Document','Location',
             'SiteLabel','SiteLabelId','Device','Application','Action'
         ),
-        [Parameter()] [hashtable]$Summary = @{}
+        [Parameter()] [hashtable]$Summary = @{},
+        # Logo parameters: provide either a single URL via -LogoUrl, or
+        # dedicated variants for light/dark themes via -LogoUrlLight / -LogoUrlDark
+        [Parameter()] [string]$LogoUrl,
+        [Parameter()] [string]$LogoUrlLight,
+        [Parameter()] [string]$LogoUrlDark,
+        [Parameter()] [string]$LogoHref,
+        [Parameter()] [string]$LogoAlt = 'Company Logo'
     )
 
     $rows = @()
@@ -567,7 +577,13 @@ html,body{height:100%}
 body{font-family:Inter,Segoe UI,Roboto,Arial,sans-serif;margin:0;color:var(--text);background:var(--bg)}
 .container{max-width:1200px;margin:0 auto;padding:24px}
 .header{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:16px;margin-bottom:12px;padding:12px 0}
-.title{font-size:22px;font-weight:700;letter-spacing:.2px}
+.title{font-size:22px;font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:10px}
+.title img.logo{height:32px;width:auto;display:inline-block}
+.title .logo-wrap{display:inline-flex;align-items:center;justify-content:center;padding:4px 6px;border-radius:8px;background:rgba(255,255,255,.06);border:1px solid var(--border);box-shadow:0 1px 2px rgba(0,0,0,.25)}
+[data-theme="light"] .title .logo-wrap{background:rgba(0,0,0,.04);box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.title img.logo-light{display:none}
+[data-theme="light"] .title img.logo-light{display:inline-block}
+[data-theme="light"] .title img.logo-dark{display:none}
 .meta{color:var(--muted);font-size:12px}
 .toolbar{display:flex;gap:8px;align-items:center}
 .theme-toggle{background:transparent;border:1px solid var(--border);color:var(--muted);padding:6px 10px;border-radius:6px;cursor:pointer}
@@ -814,17 +830,18 @@ document.addEventListener('DOMContentLoaded',initTable);
         elseif ($lk -match 'new label') { $cls = 'ok' }
         elseif ($lk -match 'open|rename|change|site') { $cls = 'accent' }
 
-        # icon by label
-        $icon = '📊'
-        if ($lk -match 'rename') { $icon = '🔁' }
-        elseif ($lk -match 'new label') { $icon = '🆕' }
-        elseif ($lk -match 'site') { $icon = '🏷️' }
-        elseif ($lk -match 'change') { $icon = '🔄' }
-        elseif ($lk -match 'open') { $icon = '👁️' }
-        elseif ($lk -match 'mismatch') { $icon = '⚠️' }
-        elseif ($lk -match 'remov') { $icon = '🗑️' }
-        elseif ($lk -match 'downgrade') { $icon = '📉' }
-
+        # normalize icon using HTML entities to avoid Unicode encoding issues
+        $icon = Switch ($true) {
+            ($lk -match 'rename')     { '&#9998;' }     # ✎
+            ($lk -match 'new label')  { '&#10133;' }    # ➕
+            ($lk -match 'site')       { '&#127760;' }   # 🌐
+            ($lk -match 'change')     { '&#8635;' }     # ↻
+            ($lk -match 'open')       { '&#128194;' }   # 📂
+            ($lk -match 'mismatch')   { '&#9888;' }     # ⚠
+            ($lk -match 'remov')      { '&#128465;' }   # 🗑️
+            ($lk -match 'downgrade')  { '&#11015;' }    # ⬇
+            Default                   { '&#9671;' }     # ◇
+        }
         $summaryCards += '<div class="card metric ' + $cls + '"><div class="label"><span class="icon">' + $icon + '</span>' + (ConvertTo-HtmlEscaped $k) + '</div><div class="value">' + (ConvertTo-HtmlEscaped $v) + '</div></div>'
     }
 
@@ -863,7 +880,31 @@ document.addEventListener('DOMContentLoaded',initTable);
     $html += '</head><body>'
     $html += '<div class="container">'
     $html += '<div class="header">'
-    $html += '<div class="title">Microsoft 365 Sensitivity Labels Audit</div>'
+    $logoHtml = ''
+    # Resolve light/dark logo sources with fallbacks
+    $srcLightRaw = if ($LogoUrlLight) { $LogoUrlLight } elseif ($LogoUrl) { $LogoUrl } else { $null }
+    $srcDarkRaw  = if ($LogoUrlDark)  { $LogoUrlDark }  elseif ($LogoUrlLight) { $LogoUrlLight } elseif ($LogoUrl) { $LogoUrl } else { $null }
+    if ($srcLightRaw -or $srcDarkRaw) {
+        $alt = ConvertTo-HtmlEscaped $LogoAlt
+        if ($srcLightRaw -and $srcDarkRaw -and ($srcLightRaw -ne $srcDarkRaw)) {
+            $srcLight = ConvertTo-HtmlEscaped $srcLightRaw
+            $srcDark  = ConvertTo-HtmlEscaped $srcDarkRaw
+            $imgInner = '<img class="logo logo-dark" src="' + $srcDark + '" alt="' + $alt + '" />' +
+                        '<img class="logo logo-light" src="' + $srcLight + '" alt="' + $alt + '" />'
+            $img = '<span class="logo-wrap">' + $imgInner + '</span>'
+        }
+        else {
+            $chosenSrc = if ($null -ne $srcDarkRaw) { $srcDarkRaw } else { $srcLightRaw }
+            $src = ConvertTo-HtmlEscaped $chosenSrc
+            $img = '<span class="logo-wrap"><img class="logo" src="' + $src + '" alt="' + $alt + '" /></span>'
+        }
+        if ($LogoHref) {
+            $href = ConvertTo-HtmlEscaped $LogoHref
+            $img = '<a class="logo-link" href="' + $href + '" target="_blank" rel="noopener">' + $img + '</a>'
+        }
+        $logoHtml = $img
+    }
+    $html += '<div class="title">' + $logoHtml + 'Microsoft 365 Sensitivity Labels Audit</div>'
     $html += '<div class="toolbar">'
     $html += '<button id="btn-theme" class="theme-toggle" type="button">Toggle Theme</button>'
     $html += '</div>'
@@ -917,7 +958,8 @@ $summary = @{
 }
 
 # Generate HTML report
-New-InteractiveHtmlReport -InputObject $Report -Path $HtmlPath -Summary $summary
+# Include Declarative logo in header by default; customize via parameters as needed
+New-InteractiveHtmlReport -InputObject $Report -Path $HtmlPath -Summary $summary -LogoHref 'https://declarative.nz/' -LogoUrl 'https://images.squarespace-cdn.com/content/v1/678588088e803d11820d06a4/8b4949d5-1e98-4804-9d76-302086fe66c4/Declarative+Logo_Full_Positive.png' -LogoAlt 'Declarative'
 Write-Host "HTML report written to $HtmlPath"
 
 if ($OpenHtml) { try { Invoke-Item -LiteralPath $HtmlPath } catch {} }
