@@ -160,7 +160,7 @@ Clear-Host
 # connection is validated when `Get-Label` runs below.
 $ModulesLoaded = Get-Module | Select-Object -ExpandProperty Name
 If (!($ModulesLoaded -match "ExchangeOnlineManagement")) {
-    Write-Host "Please connect to the Exchange Online Management module and then restart the script"
+    Write-Host -ForegroundColor Yellow "Please connect to the Exchange Online Management module and then restart the script"
     return
 }
 
@@ -170,7 +170,7 @@ $TenantLabelPriority = @{}
 Try {
     $Labels = Get-Label
 } Catch {
-    Write-Host "Your PowerShell session must be connected to the Compliance endpoint to fetch label data"
+    Write-Host -ForegroundColor Yellow "Your PowerShell session must be connected to the Compliance endpoint to fetch label data"
     return
 }
 $Labels.ForEach({
@@ -180,7 +180,7 @@ $Labels.ForEach({
 
 # --- Parameters ---
 # Using StartDateDt/EndDateDt/OutputCSVFile from param block above.
-Write-Host "Searching Microsoft 365 Audit Log to find audit records for sensitivity labels"
+Write-Host -ForegroundColor Cyan "Searching Microsoft 365 Audit Log to find audit records for sensitivity labels"
 
 # Include both file and email operations; `SensitivityLabelUpdated` is used by email.
 $Operations = @(
@@ -203,33 +203,135 @@ function Get-UAuditRecords {
          [datetime]$StartDate,
          [datetime]$EndDate,
          [string[]]$Operations,
+         [switch]$HighCompleteness,
          [int]$BatchSize = 5000
      )
-     $sessionId = [guid]::NewGuid().ToString()
-     $all   = @()
-     $page  = 1
-     while ($true) {
-         $params = @{
-             StartDate      = $StartDate
-             EndDate        = $EndDate
-             ResultSize     = $BatchSize               # per page, max 5000
-             Operations     = $Operations
-             SessionId      = $sessionId
-             SessionCommand = 'ReturnLargeSet'         # request larger pages from UAL
-             Formatted      = $true
-         }
-         $chunk = Search-UnifiedAuditLog @params
-         if ($null -eq $chunk -or $chunk.Count -eq 0) { break }
-         $all += $chunk
-         $page++
-         if ($page -gt 50) { break }                  # safety cap (max ~250k items)
-     }
-     $all | Sort-Object Identity -Unique | Sort-Object { $_.CreationDate -as [datetime] }
- }
- 
+     $cmd = Get-Command -Name Search-UnifiedAuditLog -ErrorAction SilentlyContinue
+     $supportsHigh = $cmd -and $cmd.Parameters.ContainsKey('HighCompleteness')
 
+     if ($HighCompleteness) {
+         if ($supportsHigh) {
+             $sessionId = [guid]::NewGuid().ToString()
+             $params = @{
+                 StartDate = $StartDate
+                 EndDate   = $EndDate
+                 SessionId = $sessionId
+             }
+             $hiResults = Search-UnifiedAuditLog @params -HighCompleteness -Formatted
+             if (-not $hiResults) {
+                 $hiResults = @()
+             }
+             if ($Operations -and $Operations.Count -gt 0) {
+                 $hiResults = $hiResults | Where-Object { $Operations -contains $_.Operation }
+             }
+             $sortedHigh = $hiResults | Sort-Object Identity -Unique | Sort-Object { $_.CreationDate -as [datetime] }
+             Write-Host -ForegroundColor Cyan "HighCompleteness mode: $($sortedHigh.Count) records retrieved"
+             return $sortedHigh
+         }
+
+         Write-Host -ForegroundColor Yellow "HighCompleteness requested, but the installed Search-UnifiedAuditLog command does not expose the HighCompleteness switch. Falling back to standard paging."
+     }
+
+     $nearCapThreshold = 49000
+     $initialWindow    = [TimeSpan]::FromHours(6)
+     $minWindow        = [TimeSpan]::FromMinutes(15)
+
+     $requestedSpan = $EndDate - $StartDate
+     if ($requestedSpan.TotalSeconds -le 0) {
+         throw "Invalid range supplied to Get-UAuditRecords: StartDate $StartDate EndDate $EndDate"
+     }
+     if ($requestedSpan -lt $initialWindow) { $initialWindow = $requestedSpan }
+     if ($initialWindow -lt $minWindow) { $initialWindow = $minWindow }
+
+     $currentWindow = $initialWindow
+     Write-Host -ForegroundColor Cyan ("Auto time-slicing enabled. Starting window: {0}. Minimum window: {1}." -f $currentWindow, $minWindow)
+
+     $cursor = $StartDate
+     $all = [System.Collections.Generic.List[object]]::new()
+
+     while ($cursor -lt $EndDate) {
+         $windowEnd = $cursor.Add($currentWindow)
+         if ($windowEnd -gt $EndDate) { $windowEnd = $EndDate }
+
+         $windowSession = [guid]::NewGuid().ToString()
+         $windowResults = [System.Collections.Generic.List[object]]::new()
+         $page = 1
+
+         while ($true) {
+             $params = @{
+                 StartDate      = $cursor
+                 EndDate        = $windowEnd
+                 ResultSize     = $BatchSize               # per page, max 5000
+                 SessionId      = $windowSession
+                 SessionCommand = 'ReturnLargeSet'         # request larger pages from UAL
+             }
+             if ($Operations -and $Operations.Count -gt 0) { $params.Operations = $Operations }
+             $chunk = Search-UnifiedAuditLog @params -Formatted
+             if ($null -eq $chunk -or $chunk.Count -eq 0) { break }
+             foreach ($item in $chunk) { $windowResults.Add($item) }
+             $page++
+             if ($page -gt 50) {
+                 Write-Host -ForegroundColor Yellow ("Window {0:u} - {1:u}: reached paging safety cap (50 pages). Consider reducing the time range." -f $cursor, $windowEnd)
+                 break
+             }
+         }
+
+         $windowCount = $windowResults.Count
+         Write-Host -ForegroundColor Cyan ("Window {0:u} -> {1:u}: {2} records" -f $cursor, $windowEnd, $windowCount)
+
+         if ($windowCount -ge $nearCapThreshold -and $currentWindow -gt $minWindow) {
+             $newTicks = [long]([math]::Floor($currentWindow.Ticks / 2.0))
+             if ($newTicks -lt $minWindow.Ticks) { $newTicks = $minWindow.Ticks }
+             $currentWindow = [TimeSpan]::FromTicks($newTicks)
+             Write-Host -ForegroundColor Yellow ("Near cap ({0} records). Reducing window to {1} and retrying." -f $windowCount, $currentWindow)
+             Write-Host -ForegroundColor Yellow 'Quick reference (limits):'
+             Write-Host -ForegroundColor Yellow '  - Default per call: 100'
+             Write-Host -ForegroundColor Yellow '  - Max per page (-ResultSize): 5,000'
+             Write-Host -ForegroundColor Yellow '  - Max per session (ReturnLargeSet): ~50,000'
+             Write-Host -ForegroundColor Yellow 'Microsoft caps each session at ~50k. Use time-slicing to exceed safely (auto-windowing).'
+             Write-Host -ForegroundColor Yellow 'Recommendation: run short windows (1-6 hours). If a window returns near-cap, split it; otherwise advance.'
+             continue
+         }
+
+         if ($windowCount -ge $nearCapThreshold -and $currentWindow -le $minWindow) {
+             Write-Host -ForegroundColor Yellow ("Window {0:u} -> {1:u} hit the session ceiling (~{2}). Results may be truncated; consider narrowing the time range." -f $cursor, $windowEnd, $nearCapThreshold)
+             Write-Host -ForegroundColor Yellow 'Quick reference (limits):'
+             Write-Host -ForegroundColor Yellow '  - Default per call: 100'
+             Write-Host -ForegroundColor Yellow '  - Max per page (-ResultSize): 5,000'
+             Write-Host -ForegroundColor Yellow '  - Max per session (ReturnLargeSet): ~50,000'
+             Write-Host -ForegroundColor Yellow 'Microsoft caps each session at ~50k. Use time-slicing to exceed safely (auto-windowing).'
+             Write-Host -ForegroundColor Yellow 'Recommendation: run short windows (1-6 hours). If a window returns near-cap, split it; otherwise advance.'
+         }
+
+         foreach ($item in $windowResults) { $all.Add($item) }
+
+         if ($windowCount -lt ($nearCapThreshold / 4) -and $currentWindow.Ticks -lt $initialWindow.Ticks) {
+             $growTicks = [long]([math]::Min($initialWindow.Ticks, [math]::Ceiling($currentWindow.Ticks * 2.0)))
+             if ($growTicks -gt $currentWindow.Ticks) {
+                 $currentWindow = [TimeSpan]::FromTicks($growTicks)
+                 Write-Host -ForegroundColor Cyan ("Low density detected; increasing window to {0}." -f $currentWindow)
+             }
+         }
+
+         $cursor = $windowEnd
+     }
+
+     $deduped = $all | Sort-Object Identity -Unique | Sort-Object { $_.CreationDate -as [datetime] }
+     Write-Host -ForegroundColor Cyan "Standard mode (auto time-slicing): $($deduped.Count) records retrieved"
+     return $deduped
+}
 # --- Fetch records ---
-$Records = Get-UAuditRecords -StartDate $StartDateDt -EndDate $EndDateDt -Operations $Operations
+$recordParams = @{
+    StartDate  = $StartDateDt
+    EndDate    = $EndDateDt
+    Operations = $Operations
+}
+if ($HighCompleteness) {
+    $Records = Get-UAuditRecords @recordParams -HighCompleteness
+} else {
+    $Records = Get-UAuditRecords @recordParams
+}
+
 
 # --- Counters (for summary) ---
 $GroupLabels   = 0
@@ -242,10 +344,10 @@ $OfficeFileOpens = 0
 $Downgrades    = 0
 
 if (!$Records) {
-    Write-Host "No audit records for sensitivity labels found."
+    Write-Host -ForegroundColor Yellow "No audit records for sensitivity labels found."
     return
 } else {
-    Write-Host "Processing $($Records.Count) sensitivity labels audit records..."
+    Write-Host -ForegroundColor Cyan "Processing $($Records.Count) sensitivity labels audit records..."
 }
 
 # --- Report ---
@@ -449,16 +551,16 @@ ForEach ($Rec in $Records) {
 # --- Output ---
 # Print a summary to the console and write detailed results to CSV.
 Clear-Host
-Write-Host "Job complete. $($Records.Count) Sensitivity Label audit records found for the last 180 days"
+Write-Host -ForegroundColor Green "Job complete. $($Records.Count) Sensitivity Label audit records found for the last 180 days"
 Write-Host ""
-Write-Host ("Labels applied to SharePoint sites   : {0}" -f $GroupLabels)
-Write-Host ("Labels applied to new documents      : {0}" -f $NewDocLabels)
-Write-Host ("Labels updated on documents/emails   : {0}" -f $LabelsChanged)
-Write-Host ("Labeled files edited locally/renamed : {0}" -f $LabelsRenamed)
-Write-Host ("Labeled files opened (desktop)       : {0}" -f $OfficeFileOpens)
-Write-Host ("Labels removed                       : {0}" -f $LabelsRemoved)
-Write-Host ("Mismatches detected                  : {0}" -f $MisMatches)
-Write-Host "----------------------"
+Write-Host -ForegroundColor Green ("Labels applied to SharePoint sites   : {0}" -f $GroupLabels)
+Write-Host -ForegroundColor Green ("Labels applied to new documents      : {0}" -f $NewDocLabels)
+Write-Host -ForegroundColor Green ("Labels updated on documents/emails   : {0}" -f $LabelsChanged)
+Write-Host -ForegroundColor Green ("Labeled files edited locally/renamed : {0}" -f $LabelsRenamed)
+Write-Host -ForegroundColor Green ("Labeled files opened (desktop)       : {0}" -f $OfficeFileOpens)
+Write-Host -ForegroundColor Cyan ("Labels removed                       : {0}" -f $LabelsRemoved)
+Write-Host -ForegroundColor Yellow ("Mismatches detected                  : {0}" -f $MisMatches)
+Write-Host -ForegroundColor Green "----------------------"
 Write-Host ""
 
 $Report = $Report | Sort-Object { $_.TimeStamp -as [datetime] } -Descending
@@ -486,7 +588,7 @@ if ($outDir -and -not (Test-Path -LiteralPath $outDir)) {
 }
 
 $Report | Export-Csv -NoTypeInformation $CsvPath
-Write-Host "Report file written to $CsvPath"
+Write-Host -ForegroundColor Green "Report file written to $CsvPath"
 
 # --- HTML Report ---
 function ConvertTo-HtmlEscaped {
@@ -960,10 +1062,13 @@ $summary = @{
 # Generate HTML report
 # Include Declarative logo in header by default; customize via parameters as needed
 New-InteractiveHtmlReport -InputObject $Report -Path $HtmlPath -Summary $summary -LogoHref 'https://declarative.nz/' -LogoUrl 'https://images.squarespace-cdn.com/content/v1/678588088e803d11820d06a4/8b4949d5-1e98-4804-9d76-302086fe66c4/Declarative+Logo_Full_Positive.png' -LogoAlt 'Declarative'
-Write-Host "HTML report written to $HtmlPath"
+Write-Host -ForegroundColor Green "HTML report written to $HtmlPath"
 
 if ($OpenHtml) { try { Invoke-Item -LiteralPath $HtmlPath } catch {} }
 
 if ($PassThru) {
     $Report
 }
+
+
+
