@@ -1,0 +1,37 @@
+{
+  "schema": "declarative-catalog/1",
+  "repository": "declarative-nz/community-toolbox",
+  "owner": "declarative-nz/admins",
+  "classification": "internal",
+  "summary": "PowerShell audit reporting for Microsoft Purview sensitivity label activity.",
+  "updated": "2026-10-24",
+  "entries": [
+    {
+      "id": "label-audit-export",
+      "kind": "tool",
+      "title": "Label audit exporter",
+      "summary": "Exports label audit activity and produces tabular and interactive report views.",
+      "path": "Purview/SensitivityLabelReport/Export-SensitivityLabelsAuditRecords.ps1",
+      "status": "experimental",
+      "tags": ["purview", "powershell"]
+    },
+    {
+      "id": "label-audit-guide",
+      "kind": "guide",
+      "title": "Label audit guide",
+      "summary": "Explains prerequisites, event selection and report outputs.",
+      "path": "Purview/SensitivityLabelReport/README.md",
+      "status": "experimental",
+      "tags": ["purview", "audit"]
+    },
+    {
+      "id": "label-report-design",
+      "kind": "knowledge",
+      "title": "Label report design",
+      "summary": "Records the audit reporting design for adaptation to other environments.",
+      "path": "Purview/SensitivityLabelReport/Export-SensitivityLabelsReport-DesignNotes.md",
+      "status": "experimental",
+      "tags": ["purview", "reporting"]
+    }
+  ]
+}
